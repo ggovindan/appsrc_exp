@@ -2,6 +2,9 @@ use gst::prelude::*;
 use anyhow::Error;
 use derive_more::{Display, Error};
 use gst::BufferFlags;
+use std::io::{BufReader, Read};
+use std::fs::File;
+use std::{thread, time};
 
 #[cfg(not(target_os = "macos"))]
 pub fn run<T, F: FnOnce() -> T + Send + 'static>(main: F) -> T
@@ -73,7 +76,10 @@ fn main_loop(pipeline: gst::Pipeline) -> Result<(), Error> {
         use gst::MessageView;
 
         match msg.view() {
-            MessageView::Eos(..) => break,
+            MessageView::Eos(..) => {
+                println!("got eos!!");
+                break
+            }
             MessageView::Error(err) => {
                 pipeline.set_state(gst::State::Null)?;
                 return Err(ErrorMessage {
@@ -103,83 +109,82 @@ fn create_pipeline() -> Result<gst::Pipeline, Error> {
 
     let pipeline = gst::Pipeline::default();
 
-    let video_info = gst_video::VideoInfo::builder(gst_video::VideoFormat::Bgrx, WIDTH as u32, HEIGHT as u32)
-        .fps(gst::Fraction::new(2, 1))
-        .build()
-        .expect("Failed to create video info");
-
-    let appsrc = gst_app::AppSrc::builder()
-        .caps(&video_info.to_caps().unwrap())
-        .format(gst::Format::Time)
+    let video_info = &gst::Caps::builder("video/mpegts")
+        .field("systemstream", true)
         .build();
 
-    let videoconvert = gst::ElementFactory::make("videoconvert").build()?;
-    let avenc = gst::ElementFactory::make("avenc_h264_videotoolbox").build()?;
+    let appsrc = gst_app::AppSrc::builder()
+        .caps(video_info)
+        .format(gst::Format::Time)
+        .is_live(false)
+        .build();
+
+    // gst-launch-1.0 filesrc location=dip.ts ! tsdemux name=demux demux. ! h264parse ! decodebin ! videoconvert ! autovideosink
+    // gst-launch-1.0 filesrc location=dip.ts ! tsdemux name=demux demux. ! h264parse ! mpegtsmux ! filesink location=pp.ts
+    let tsdemux = gst::ElementFactory::make("tsdemux").build()?;
+    let h264parse = gst::ElementFactory::make("h264parse").build()?;
     let mpegtsmux = gst::ElementFactory::make("mpegtsmux").build()?;
     let filesink = gst::ElementFactory::make("multifilesink").build()?;
+    //let filesink = gst::ElementFactory::make("filesink").build()?;
     filesink.set_property("location", "%d.ts");
-    filesink.set_property("post-messages", true);
-    filesink.set_property_from_str("next-file", "discont");
+    //filesink.set_property("post-messages", true);
+    filesink.set_property_from_str("next-file", "buffer");
 
-    pipeline.add_many(&[appsrc.upcast_ref(), &videoconvert, &avenc, &mpegtsmux, &filesink])?;
-    gst::Element::link_many(&[appsrc.upcast_ref(), &videoconvert, &avenc, &mpegtsmux, &filesink])?;
+    // moved out of lambda to avoid move closures
+    let video_sink_pad = h264parse.static_pad("sink").expect("could not get sink pad from h264parse");
 
-    let mut i = 0;
+    pipeline.add_many(&[appsrc.upcast_ref(), &tsdemux, h264parse.upcast_ref(), &mpegtsmux, &filesink])?;
+    gst::Element::link_many(&[appsrc.upcast_ref(), &tsdemux])?;
 
-    appsrc.set_callbacks(
-        gst_app::AppSrcCallbacks::builder()
-            .need_data(move |appsrc, _| {
-                if i == 100 {
-                    let _ = appsrc.end_of_stream();
-                    println!("sending EOS to appsrc");
-                    return;
-                }
+    tsdemux.connect_pad_added(move |_src, src_pad| {
+        let is_video = if src_pad.name().starts_with("video") {
+            true
+        } else {
+            false
+        };
 
-                println!("producing frame {}", i);
+        let connect_demux = || -> Result<(), Error> {
+            src_pad.link(&video_sink_pad).expect("failed to link tsdemux.video->h264parse.sink");
+            println!("linked tsdemux->h264parse");
+            Ok(())
+        };
 
-                let r = if i % 2 == 0 { 0 } else { 255 };
-                let g = if i % 3 == 0 { 0 } else { 255 };
-                let b = if i % 5 == 0 { 0 } else { 255 };
+        if is_video {
+            match connect_demux() {
+                Ok(_) => println!("tsdemux->h264 connected"),
+                Err(e) => println!("could not connect tsdemux->h264parse e:{}", e),
+            }
+        }
+    });
 
-                let mut buffer = gst::Buffer::with_size(video_info.size()).unwrap();
 
-                {
-                    let buffer = buffer.get_mut().unwrap();
-                    if i % 10 == 0 {
-                        buffer.set_flags(BufferFlags::LIVE | BufferFlags::DISCONT)
-                    }
+    gst::Element::link_many(&[&h264parse.upcast_ref(), &mpegtsmux, &filesink])?;
 
-                    // let the player know when to play this frame
-                    buffer.set_pts(i * 500 * gst::ClockTime::MSECOND);
+     appsrc.set_callbacks(
+         gst_app::AppSrcCallbacks::builder()
+             .need_data(move |appsrc, _| {
+                 println!("getting the file");
+                 let mut file = File::open("./sample/test_1620.ts").unwrap();
+                 let mut buffer = Vec::new();
+                 match file.read_to_end(&mut buffer) {
+                     Ok(_) => {
+                         println!("finished reading bytes from file len={}", buffer.len());
+                     }
+                     Err(e) => {
+                         println!("error reading file: {}", e);
+                     }
+                 };
+                 //let reader = BufReader::new(file);
+                 //let file_buf = reader.buffer();
+                 let gst_buffer = gst::Buffer::from_slice(buffer);
+                 println!("buffer size of teh generated gst_buffer={}", gst_buffer.size());
+                 appsrc.end_of_stream();
+                 let _ = appsrc.push_buffer(gst_buffer);
+                 println!("sleeping for 10 secs");
+                 thread::sleep(time::Duration::from_secs(10));
+             }).build(),
+     );
 
-                    let mut vframe = gst_video::VideoFrameRef::from_buffer_ref_writable(buffer, &video_info).unwrap();
-
-                    let width = vframe.width() as usize;
-                    let height = vframe.height() as usize;
-
-                    let stride = vframe.plane_stride()[0] as usize;
-
-                    for line in vframe
-                        .plane_data_mut(0)
-                        .unwrap()
-                        .chunks_exact_mut(stride)
-                        .take(height)
-                    {
-                        // Iterate over each pixel of 4 bytes in that line
-                        for pixel in line[..(4 * width)].chunks_exact_mut(4) {
-                            pixel[0] = b;
-                            pixel[1] = g;
-                            pixel[2] = r;
-                            pixel[3] = 0;
-                        }
-                    }
-                }
-                i += 1;
-
-                let _ = appsrc.push_buffer(buffer);
-            })
-            .build(),
-    );
     Ok(pipeline)
 
 }
