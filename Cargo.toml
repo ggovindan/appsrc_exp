@@ -20,3 +20,6 @@ gst-pbutils = { package = "gstreamer-pbutils", version = "0.21.1", features = ["
 
 anyhow = "1.0"
 derive_more = "0.99.5"
+lazy_static = "1.4.0"
+tracing = "0.1.40"
+tracing-subscriber = {version = "0.3.18", features=["env-filter", "json"]}
